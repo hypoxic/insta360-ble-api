@@ -49,6 +49,7 @@ import time
 import threading
 
 from google.protobuf import json_format
+from transport import TransportFactory, TransportBase
 sys.path.append('pb2')
 import capture_state_pb2
 import current_capture_status_pb2
@@ -165,21 +166,25 @@ class camera:
         PHONE_COMMAND_GET_CURRENT_CAPTURE_STATUS: get_current_capture_status_pb2.CameraCaptureStatus()
     }
 
-    def __init__(self, host='192.168.42.1', port=6666, logger=None, callback=None):
+    def __init__(self, host='192.168.42.1', port=6666, logger=None, callback=None, transport='wifi', device_address=None, scan_timeout=None):
         self.connect_host = host
         self.connect_port = port
+        self.transport_type = transport
+        self.device_address = device_address
+        self.scan_timeout = scan_timeout
         if logger is None:
             self.logger = logging.getLogger(None)
         else:
             self.logger = logger
         self.callback_handler = callback
-        self.camera_socket = None
+        self.transport: TransportBase = None
+        self.camera_socket = None  # Keep for compatibility
         self.timer_keepalive = None
         self.message_seq = 0
         self.sent_messages_codes = {}
         self.rcv_thread = None
         self.rcv_buffer = b''
-        self.socket_lock = None
+        self.socket_lock = threading.Lock()  # Initialize lock immediately
         self.is_connected = False
         self.reconnect_time = time.time()
         self.last_pkt_sent_time = time.time()
@@ -187,6 +192,8 @@ class camera:
         self.program_killed = False
         signal.signal(signal.SIGTERM, self.SignalHandler)
         signal.signal(signal.SIGINT, self.SignalHandler)
+        # Create transport instance
+        self.transport = TransportFactory.create_transport(self.transport_type, self.logger)
         # Enable async receiving function.
         self.rcv_thread = threading.Thread(target=self.receive_packet, daemon=True)
         self.rcv_thread.start()
@@ -200,41 +207,58 @@ class camera:
 
 
     def Open(self):
-        """ Open a TCP socket to the camera """
+        """ Open connection to the camera """
         self.Close()
         self.reconnect_time = time.time()
-        self.logger.info('Connecting socket to host %s:%d' % (self.connect_host, self.connect_port))
-        try:
-            self.camera_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.camera_socket.settimeout(self.SOCKET_TIMEOUT_SEC)
-            self.camera_socket.connect((self.connect_host, self.connect_port))
-            self.logger.debug('Socket opened')
-        except Exception as ex:
-            self.logger.error('Exception in socket.connect(): %s' % (ex,))
-            self.camera_socket = None
-        if not self.program_killed:
-            # Mutex lock for socket send/receive.
-            self.socket_lock = threading.Lock()
-            # Send the first packets.
-            self.send_packet(self.PKT_SYNC)
-            self.send_packet(self.PKT_KEEPALIVE)
-            self.SyncLocalTimeToCamera()
-            # Enable async timers.
-            self.timer_keepalive = self.KeepAliveTimer(self.KEEPALIVE_INTERVAL_SEC, self.KeepAlive)
-            self.timer_keepalive.start()
+        
+        # Connect using transport
+        if self.transport_type == 'wifi':
+            self.logger.info('Connecting via WiFi to %s:%d' % (self.connect_host, self.connect_port))
+            success = self.transport.connect(host=self.connect_host, port=self.connect_port)
+        elif self.transport_type == 'ble':
+            self.logger.info('Connecting via BLE' + (f' to {self.device_address}' if self.device_address else ''))
+            success = self.transport.connect(device_address=self.device_address, scan_timeout=self.scan_timeout)
+        else:
+            self.logger.error(f'Unknown transport type: {self.transport_type}')
+            return
+            
+        if success:
+            self.is_connected = True
+            # Start receiving data
+            self.transport.start_receiving(self._transport_receive_callback)
+            
+            if not self.program_killed:
+                # Send the first packets.
+                self.send_packet(self.PKT_SYNC)
+                self.send_packet(self.PKT_KEEPALIVE)
+                self.SyncLocalTimeToCamera()
+                # Enable async timers.
+                self.timer_keepalive = self.KeepAliveTimer(self.KEEPALIVE_INTERVAL_SEC, self.KeepAlive)
+                self.timer_keepalive.start()
+        else:
+            self.is_connected = False
+    
+    def _transport_receive_callback(self, data: bytes):
+        """Callback for transport layer to deliver received data"""
+        if self.socket_lock:
+            with self.socket_lock:
+                self.rcv_buffer += data
+        else:
+            self.rcv_buffer += data
 
 
     def Close(self):
-        """ Stop the keep alive timer and close the TCP socket """
-        self.logger.debug('Stopping keepalive timer and closing socket')
+        """ Stop the keep alive timer and close connection """
+        self.logger.debug('Stopping keepalive timer and closing connection')
+        # First stop the timer to prevent new sends
         if self.timer_keepalive is not None:
             self.timer_keepalive.cancel()
             self.timer_keepalive = None
-        if self.camera_socket is not None:
-            self.camera_socket.shutdown(socket.SHUT_RDWR)
-            self.camera_socket.close()
-            self.camera_socket = None
+        # Mark as disconnected immediately
         self.is_connected = False
+        # Then disconnect transport
+        if self.transport:
+            self.transport.disconnect()
         self.message_seq = 0
         self.sent_messages_codes = {}
 
@@ -248,6 +272,10 @@ class camera:
 
     def SendMessage(self, message, message_code):
         """ Convert a dictionary into a protobuf message and send it """
+        if not self.is_connected:
+            self.logger.warning('Cannot send message: not connected')
+            return -1
+            
         with self.socket_lock:
             seq_number = self.message_seq
             self.message_seq += 1
@@ -303,8 +331,8 @@ class camera:
 
 
     def send_packet(self, pkt_payload):
-        """ Send pkt_data (bytearray) to the socket, prepending the overall length """
-        if self.camera_socket is not None:
+        """ Send pkt_data (bytearray) to the transport, prepending the overall length """
+        if self.transport and self.transport.is_connected:
             pkt_data = bytearray(struct.pack('<i', len(pkt_payload) + 4))
             pkt_data.extend(pkt_payload)
             self.logger.info("Sending packet: b'%s%s'" % (bytes_to_hex(pkt_payload[:12]), bytes_to_hexascii(pkt_payload[12:])))
@@ -313,57 +341,67 @@ class camera:
 
 
     def socket_send(self, pkt_data):
-        """ Send the bytearray pkt_data to socket, return False on error """
-        try:
-            with self.socket_lock:
-                self.camera_socket.sendall(pkt_data)
-        except Exception as ex:
-            self.logger.error('Exception in socket.sendall(): %s' % (ex,))
+        """ Send the bytearray pkt_data to transport, return False on error """
+        if not self.transport:
             return False
-        return True
+        return self.transport.send(bytes(pkt_data))
 
 
     def receive_packet(self):
-        """ Receive data from socket and assemble full packets """
-        # Wait for the main thread to eventually open the socket.
+        """ Process received data and assemble full packets """
+        # Wait for the main thread to eventually open connection.
         time.sleep(0.12)
-        # Start an infinite loop to receive packets.
+        # Start an infinite loop to process packets.
         while True:
             self.logger.debug('Loop receive_packet() thread')
-            if self.camera_socket is None:
+            if not self.transport or not self.transport.is_connected:
                 time.sleep(1.0)
                 continue
+            
+            # Process data from rcv_buffer (filled by transport callback)
             pkt_len = None
             pkt_data = b''
             t0 = time.time()
-            poller = select.poll()
-            poller.register(self.camera_socket, select.POLLIN)
+            
             # Loop waiting a packet to be complete.
             while True:
-                self.logger.debug("Receiving buffer: b'%s'" % (bytes_to_hexascii(self.rcv_buffer,)))
-                if pkt_len is None and len(self.rcv_buffer) >= 4:
-                    pkt_len = int.from_bytes(self.rcv_buffer[0:4], byteorder='little')
-                    self.logger.debug('Received begin of packet, length = %d' % (pkt_len,))
-                if pkt_len is not None and len(self.rcv_buffer) >= pkt_len:
-                    self.logger.debug('Packet is complete, len(rcv_buffer): %s' % (len(self.rcv_buffer,)))
-                    pkt_data = self.rcv_buffer[4:pkt_len]
-                    self.rcv_buffer = self.rcv_buffer[pkt_len:]
-                    break
-                # Packet is not complete wait data from the socket.
-                try:
-                    self.logger.debug('Polling socket for data')
-                    evts = poller.poll(int(self.PKT_COMPLETE_TIMEOUT_SEC * 1000))
-                    for sock, evt in evts:
-                        if evt and select.POLLIN:
-                            if self.camera_socket is not None and sock == self.camera_socket.fileno():
-                                self.rcv_buffer += self.camera_socket.recv(4096)
-                except Exception as ex:
-                    self.logger.error('Exception in receive_packet(): %s' % (ex,))
+                # Use lock when accessing shared buffer
+                if self.socket_lock:
+                    with self.socket_lock:
+                        buffer_len = len(self.rcv_buffer)
+                        if buffer_len > 0:
+                            self.logger.debug("Receiving buffer: b'%s'" % (bytes_to_hexascii(self.rcv_buffer,)))
+                        
+                        if pkt_len is None and buffer_len >= 4:
+                            pkt_len = int.from_bytes(self.rcv_buffer[0:4], byteorder='little')
+                            self.logger.debug('Received begin of packet, length = %d' % (pkt_len,))
+                            
+                        if pkt_len is not None and buffer_len >= pkt_len:
+                            self.logger.debug('Packet is complete, len(rcv_buffer): %s' % (buffer_len,))
+                            pkt_data = self.rcv_buffer[4:pkt_len]
+                            self.rcv_buffer = self.rcv_buffer[pkt_len:]
+                            break
+                else:
+                    # No lock available yet
+                    if pkt_len is None and len(self.rcv_buffer) >= 4:
+                        pkt_len = int.from_bytes(self.rcv_buffer[0:4], byteorder='little')
+                        
+                    if pkt_len is not None and len(self.rcv_buffer) >= pkt_len:
+                        pkt_data = self.rcv_buffer[4:pkt_len]
+                        self.rcv_buffer = self.rcv_buffer[pkt_len:]
+                        break
+                    
+                # Packet is not complete, wait for more data
+                time.sleep(0.01)  # Small sleep to avoid busy waiting
+                
                 if time.time() - t0 > self.PKT_COMPLETE_TIMEOUT_SEC:
                     self.logger.warning("Timeout in receive_packet(). Discarding buffer: b'%s'" % (bytes_to_hexascii(self.rcv_buffer),))
+                    self.rcv_buffer = b''  # Clear buffer on timeout
                     break
+                    
             # The packet is complete or receiving complete packet timeout.
-            self.parse_packet(pkt_data)
+            if pkt_data:
+                self.parse_packet(pkt_data)
 
 
 

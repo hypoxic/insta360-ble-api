@@ -1,18 +1,21 @@
-# insta360-wifi-api
+# insta360-ble-api
 
-**Python scripts to talk to Insta360 action cameras using the WiFi API**
+**Python scripts to talk to Insta360 action cameras using WiFi or Bluetooth LE**
 
-The insta360.py is a Python class which partially implements the 
-WiFi API interface (TCP socket on port 6666) to communicate and 
-control an Insta360 camera. It was developed by reverse 
-engineering the communication between an **Insta360 ONE RS** 
-camera and the Android app.
+The insta360.py is a Python class which implements both WiFi and 
+BLE (Bluetooth Low Energy) interfaces to communicate and control 
+an Insta360 camera. The WiFi API uses a TCP socket on port 6666, 
+while BLE uses GATT characteristics. It was developed by reverse 
+engineering the communication between an **Insta360 ONE RS** / 
+**X4** camera and the Android app.
 
-## Connecting to the WiFi
+## Connection Methods
 
-Fortunately enough it is possibile to connect a GNU/Linux PC to 
-the Insta360 through the WiFi, the default passowrd of the 
-camera internal access point is **88888888**.
+### WiFi Connection
+
+It is possible to connect a GNU/Linux PC to the Insta360 through 
+WiFi. The default password of the camera internal access point is 
+**88888888**.
 
 Said incidentally, this is an **huge security hole** of the 
 camera: as far I know it is not possibile to disable the WiFi 
@@ -23,6 +26,27 @@ you can also do a **telnet** into the Insta360's GNU/Linux
 operating system as **root** (the IP address of the camera is 
 **192.168.42.1**) and do whaterver you want, even to damage 
 permanently (brick) the camera.
+
+### Bluetooth LE Connection
+
+The camera can also be controlled via Bluetooth Low Energy (BLE), 
+which doesn't require joining the camera's WiFi network. This is 
+more convenient for mobile use. The BLE connection uses standard 
+GATT services and is compatible with most modern devices.
+
+## Dependencies
+
+Install the required Python packages:
+
+```bash
+pip install -r requirements.txt
+```
+
+Or manually:
+```bash
+pip install protobuf==3.20.0  # Core dependency
+pip install bleak             # For BLE support (optional)
+```
 
 ## What is working
 
@@ -42,18 +66,48 @@ what parameters are accepted.
 * TakePicture()
 * GetCameraFilesList()
 
-**Usage example:**
+**Usage examples:**
 
+WiFi connection:
 ```python
 #!/usr/bin/env python3
 
 import logging
 import insta360
+import time
 
 logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s')
 logging.getLogger().setLevel(logging.DEBUG)
 
-cam = insta360.camera(host='192.168.42.1', port=6666)
+# Connect via WiFi
+cam = insta360.camera(host='192.168.42.1', port=6666, transport='wifi')
+cam.Open()
+
+seq = cam.StartCapture()
+print('Sent packet StartCapture(): seq: %d' % (seq,))
+time.sleep(20)
+seq = cam.StopCapture()
+print('Sent packet StopCapture(): seq: %d' % (seq,))
+
+# Wait messages eventually in the queue.
+time.sleep(5)
+cam.Close()
+```
+
+BLE connection:
+```python
+#!/usr/bin/env python3
+
+import logging
+import insta360
+import time
+
+logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s')
+logging.getLogger().setLevel(logging.DEBUG)
+
+# Connect via BLE (will scan for camera)
+cam = insta360.camera(transport='ble')
+# Or specify device address: cam = insta360.camera(transport='ble', device_address='XX:XX:XX:XX:XX:XX')
 cam.Open()
 
 seq = cam.StartCapture()
@@ -92,6 +146,19 @@ recording, take picture, set the video resolution and zoom. You
 can run it from an Android smartphone if you install the 
 [Termux](https://termux.dev/en/) app and the required Python 
 libraries.
+
+The remote control now supports both WiFi and BLE connections:
+
+```bash
+# WiFi connection (default)
+./insta360-remote -i 192.168.42.1
+
+# BLE connection (auto-scan for camera)
+./insta360-remote -t ble
+
+# BLE connection with specific device
+./insta360-remote -t ble -b XX:XX:XX:XX:XX:XX
+```
 
 ![insta360-remote screenshot](img/insta360-remote.png "insta360-remote screenshot")
 

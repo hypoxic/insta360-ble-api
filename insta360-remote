@@ -11,6 +11,7 @@ It requires the insta360.py Python module.
 
 import insta360
 
+import argparse
 import curses
 import logging
 import sys
@@ -234,14 +235,19 @@ def handle_message(msg):
         win_status.addstr(' S ', curses.color_pair(curses.COLOR_WHITE))
     else:
         win_status.addstr(' R ', curses.color_pair(curses.COLOR_RED))
-    status = ' %s%%, %s, %s, %.1fmm %s\nGamma: %s, WB: %s' % (battery_level, pretty_bytes(free_space), record_resolution, focal_length_value, fov_type, gamma_mode, white_balance_value)
+    # Get connection info
+    connection_info = ''
+    if 'cam' in globals() and cam and cam.transport:
+        connection_info = cam.transport.connection_info + ' | '
+    
+    status = ' %s%%, %s, %s, %.1fmm %s\n%sGamma: %s, WB: %s' % (battery_level, pretty_bytes(free_space), record_resolution, focal_length_value, fov_type, connection_info, gamma_mode, white_balance_value)
     safe_addstr(status, win_status, extra_x=3)
     win_status.refresh()
 
 
 
-def main(screen):
-    global logger, win_status
+def main(screen, transport_config):
+    global logger, win_status, cam
 
     # Initialize curses.
     curses.initscr()
@@ -281,14 +287,71 @@ def main(screen):
     logger.setLevel(logging.INFO)
 
     logger.info('Starting %s' % (sys.argv[0],))
-    cam = insta360.camera(host='192.168.42.1', port=6666, logger=logger, callback=handle_message)
-    cam.Open()
-
+    logger.info('Using %s transport' % (transport_config['transport'],))
+    
+    # Create camera instance with appropriate transport
+    if transport_config['transport'] == 'wifi':
+        cam = insta360.camera(
+            host=transport_config['host'], 
+            port=6666, 
+            logger=logger, 
+            callback=handle_message,
+            transport='wifi'
+        )
+    else:  # ble
+        cam = insta360.camera(
+            logger=logger, 
+            callback=handle_message,
+            transport='ble',
+            device_address=transport_config['ble_address']
+        )
+    
     current_menu = MAIN_MENU
+    win_menu.timeout(100)  # Non-blocking with 100ms timeout
+    
+    # Start connection in background
+    cam.Open()
+    
+    # For BLE, show status while connecting
+    if transport_config['transport'] == 'ble':
+        safe_addstr("Scanning/Connecting via BLE... Press 'q' to quit", win_status)
+        win_status.refresh()
+    
+    # Poll for connection with responsive UI
+    connection_start = time.time()
+    while not cam.is_connected:
+        # Check for user input
+        key = win_menu.getch()
+        if key == ord('q'):
+            logging.getLogger().setLevel(logging.CRITICAL)
+            cam.Close()
+            curses.endwin()
+            print('\033[2J\033[H', end='', flush=True)
+            return
+            
+        # Update status periodically
+        elapsed = int(time.time() - connection_start)
+        if transport_config['transport'] == 'ble':
+            status_msg = f"BLE: Scanning/Connecting... ({elapsed}s) Press 'q' to quit"
+            win_status.clear()
+            safe_addstr(status_msg, win_status)
+            win_status.refresh()
+            
+        time.sleep(0.1)
+    
+    # Reset timeout for normal operation
     win_menu.timeout(6000)
-    cam.GetCameraInfo()
-    cam.GetNormalVideoOptions()
-    cam.GetCaptureCurrentStatus()
+    
+    # Check if connected before sending commands
+    if cam.is_connected:
+        safe_addstr("Connected! Getting camera info...", win_status)
+        win_status.refresh()
+        cam.GetCameraInfo()
+        cam.GetNormalVideoOptions()
+        cam.GetCaptureCurrentStatus()
+    else:
+        safe_addstr("Not connected. Press 'q' to quit.", win_status)
+        win_status.refresh()
 
     # TESTING: Fake status message.
     #msg = {
@@ -405,8 +468,29 @@ def main(screen):
                 )
             cam.GetNormalVideoOptions()
 
+    # Clean shutdown: stop logging before ending curses
+    logging.getLogger().setLevel(logging.CRITICAL)
     cam.Close()
     curses.endwin()
+    # Clear any remaining output
+    print('\033[2J\033[H', end='', flush=True)  # Clear screen and move cursor to top
+
+# Parse command-line arguments
+parser = argparse.ArgumentParser(description='Remote control for Insta360 camera')
+parser.add_argument('-i', '--host', default='192.168.42.1',
+                    help='Camera IP address for WiFi connection (default: 192.168.42.1)')
+parser.add_argument('-t', '--transport', choices=['wifi', 'ble'], default='wifi',
+                    help='Transport method: wifi or ble (default: wifi)')
+parser.add_argument('-b', '--ble-address', 
+                    help='BLE device address (optional, will scan if not provided)')
+args = parser.parse_args()
+
+# Store arguments for use in main()
+transport_config = {
+    'transport': args.transport,
+    'host': args.host,
+    'ble_address': args.ble_address
+}
 
 # Execute the main loop.
-curses.wrapper(main)
+curses.wrapper(lambda screen: main(screen, transport_config))
